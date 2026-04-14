@@ -1,61 +1,63 @@
 import streamlit as st
-import tempfile
-import os
 from io import BytesIO
-
 from pypdf import PdfReader
 from docx import Document
-
-import chromadb
 from openai import OpenAI
+import math
 
-# Initialize OpenAI client
+st.set_page_config(page_title="RAG Document QA App", layout="wide")
+
+# -----------------------------
+# OPENAI CLIENT
+# -----------------------------
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Initialize Chroma DB
-chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(name="docs")
 
 # -----------------------------
-# FILE PARSING
+# HELPERS
 # -----------------------------
 def extract_text(file_name, file_bytes):
-    text = ""
+    file_name = file_name.lower()
 
     if file_name.endswith(".pdf"):
         reader = PdfReader(BytesIO(file_bytes))
+        text = []
         for page in reader.pages:
-            text += page.extract_text() or ""
+            page_text = page.extract_text()
+            if page_text:
+                text.append(page_text)
+        return "\n".join(text)
 
     elif file_name.endswith(".docx"):
         doc = Document(BytesIO(file_bytes))
-        for p in doc.paragraphs:
-            text += p.text + "\n"
+        return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
 
     elif file_name.endswith(".txt"):
-        text = file_bytes.decode("utf-8", errors="ignore")
+        return file_bytes.decode("utf-8", errors="ignore")
 
-    return text
+    else:
+        return ""
 
 
-# -----------------------------
-# CHUNKING
-# -----------------------------
-def chunk_text(text, chunk_size=800, overlap=150):
+def chunk_text(text, chunk_size=1000, overlap=200):
+    text = text.strip()
+    if not text:
+        return []
+
     chunks = []
     start = 0
+    step = chunk_size - overlap
 
     while start < len(text):
         end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += step
 
     return chunks
 
 
-# -----------------------------
-# EMBEDDINGS
-# -----------------------------
 def get_embedding(text):
     response = client.embeddings.create(
         model="text-embedding-3-small",
@@ -64,55 +66,72 @@ def get_embedding(text):
     return response.data[0].embedding
 
 
-# -----------------------------
-# INGEST DOCUMENT
-# -----------------------------
-def ingest_document(file_name, file_bytes):
+def cosine_similarity(vec1, vec2):
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+
+    return dot_product / (norm1 * norm2)
+
+
+def index_document(file_name, file_bytes):
     text = extract_text(file_name, file_bytes)
 
     if not text.strip():
-        st.error("No text found in document (maybe scanned PDF?)")
-        return
+        return None, "Document se text extract nahi hua. Agar scanned PDF hai to OCR chahiye hoga."
 
     chunks = chunk_text(text)
 
-    ids = []
-    embeddings = []
-    documents = []
+    if not chunks:
+        return None, "Document me usable text chunks nahi bane."
 
+    embedded_chunks = []
     for i, chunk in enumerate(chunks):
-        ids.append(f"{file_name}_{i}")
-        embeddings.append(get_embedding(chunk))
-        documents.append(chunk)
+        emb = get_embedding(chunk)
+        embedded_chunks.append({
+            "chunk_id": i,
+            "text": chunk,
+            "embedding": emb
+        })
 
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=documents
-    )
-
-    st.success(f"Document indexed with {len(chunks)} chunks ✅")
+    return {
+        "file_name": file_name,
+        "chunks": embedded_chunks
+    }, None
 
 
-# -----------------------------
-# ASK QUESTION
-# -----------------------------
-def ask_question(question):
+def retrieve_relevant_chunks(question, indexed_doc, top_k=4):
     query_embedding = get_embedding(question)
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=4
+    scored = []
+    for item in indexed_doc["chunks"]:
+        score = cosine_similarity(query_embedding, item["embedding"])
+        scored.append({
+            "chunk_id": item["chunk_id"],
+            "text": item["text"],
+            "score": score
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
+
+
+def generate_answer(question, relevant_chunks):
+    context = "\n\n---\n\n".join(
+        [f"[Chunk {c['chunk_id']}]\n{c['text']}" for c in relevant_chunks]
     )
 
-    retrieved_chunks = results["documents"][0]
-    context = "\n\n---\n\n".join(retrieved_chunks)
-
     prompt = f"""
-You are a helpful assistant.
-Answer ONLY from the context below.
-If answer is not present, say:
-"I could not find that in the document."
+You are a helpful document question-answering assistant.
+
+Answer ONLY from the provided context.
+If the answer is not clearly present in the context, say:
+"I could not find that in the uploaded document."
+
+Also mention the chunk numbers you used when relevant.
 
 Context:
 {context}
@@ -124,8 +143,14 @@ Question:
     response = client.chat.completions.create(
         model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "You answer using document context only."},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": "You answer questions only from retrieved document context."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
         ]
     )
 
@@ -133,26 +158,63 @@ Question:
 
 
 # -----------------------------
-# STREAMLIT UI
+# SESSION STATE
 # -----------------------------
-st.set_page_config(page_title="RAG App", layout="wide")
+if "indexed_doc" not in st.session_state:
+    st.session_state.indexed_doc = None
 
+
+# -----------------------------
+# UI
+# -----------------------------
 st.title("📄 RAG Document QA App")
+st.write("Upload PDF, DOCX, ya TXT file aur us par questions poocho.")
 
-uploaded_file = st.file_uploader("Upload a document", type=["pdf", "docx", "txt"])
+uploaded_file = st.file_uploader(
+    "Upload your document",
+    type=["pdf", "docx", "txt"]
+)
 
-if uploaded_file:
-    file_bytes = uploaded_file.read()
-
+if uploaded_file is not None:
     if st.button("Process Document"):
-        ingest_document(uploaded_file.name, file_bytes)
+        with st.spinner("Document process ho raha hai..."):
+            file_bytes = uploaded_file.read()
+            indexed_doc, error = index_document(uploaded_file.name, file_bytes)
 
-st.divider()
+            if error:
+                st.error(error)
+            else:
+                st.session_state.indexed_doc = indexed_doc
+                st.success(
+                    f"{indexed_doc['file_name']} successfully indexed. "
+                    f"Total chunks: {len(indexed_doc['chunks'])}"
+                )
 
-question = st.text_input("Ask a question about your document:")
+if st.session_state.indexed_doc is not None:
+    st.subheader("Ask a question")
+    question = st.text_input("Enter your question")
 
-if st.button("Get Answer"):
-    if question:
-        answer = ask_question(question)
-        st.write("### Answer:")
-        st.write(answer)
+    if st.button("Get Answer"):
+        if not question.strip():
+            st.warning("Pehle question likho.")
+        else:
+            with st.spinner("Answer generate ho raha hai..."):
+                relevant_chunks = retrieve_relevant_chunks(
+                    question,
+                    st.session_state.indexed_doc,
+                    top_k=4
+                )
+
+                answer = generate_answer(question, relevant_chunks)
+
+                st.markdown("### Answer")
+                st.write(answer)
+
+                with st.expander("Retrieved Chunks"):
+                    for chunk in relevant_chunks:
+                        st.markdown(
+                            f"**Chunk {chunk['chunk_id']}** "
+                            f"(score: {chunk['score']:.4f})"
+                        )
+                        st.write(chunk["text"])
+                        st.markdown("---")
